@@ -102,7 +102,10 @@ class ArXivOrganizer:
             print(f"Error adding paper: {str(e)}")
 
     def add_folder(self, folder_path):
-        for root, _, files in os.walk(folder_path):
+        for root, dirs, files in os.walk(folder_path, topdown=True):
+            # Modify dirs in-place to exclude 'Unsorted' from further traversal
+            dirs[:] = [d for d in dirs if d != "Unsorted"]
+
             for file in files:
                 if file.endswith(".pdf"):
                     self.add_paper(os.path.join(root, file))
