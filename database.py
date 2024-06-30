@@ -96,7 +96,7 @@ class ArXivOrganizer:
                 )
 
             self.conn.commit()
-            print(f"Paper {arxiv_id} added successfully.")
+            print(f"{arxiv_id}: {paper.title}")
         except Exception as e:
             self.conn.rollback()
             print(f"Error adding paper: {str(e)}")
@@ -173,11 +173,12 @@ class ArXivOrganizer:
 
             if result:
                 title, abstract, file_path, authors = result
+                cleaned_file_path = os.path.abspath(file_path).replace(" ", "%20")
                 print(f"ID: {arxiv_id}")
                 print(f"Title: {title}")
                 print(f"Authors: {authors}")
                 print(f"Abstract: {abstract}")
-                print(f"File Path: {file_path}")
+                print(f"File Path: file://{cleaned_file_path}")
             else:
                 print(f"No paper found with ID: {arxiv_id}")
         except Exception as e:
