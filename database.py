@@ -156,6 +156,33 @@ class ArXivOrganizer:
     def close(self):
         self.conn.close()
 
+    def show_paper(self, arxiv_id):
+        try:
+            self.c.execute(
+                """
+                SELECT p.title, p.abstract, p.file_path, GROUP_CONCAT(a.name, '; ') as authors
+                FROM papers p
+                LEFT JOIN paper_authors pa ON p.id = pa.paper_id
+                LEFT JOIN authors a ON pa.author_id = a.id
+                WHERE p.id = ?
+                GROUP BY p.id
+            """,
+                (arxiv_id,),
+            )
+            result = self.c.fetchone()
+
+            if result:
+                title, abstract, file_path, authors = result
+                print(f"ID: {arxiv_id}")
+                print(f"Title: {title}")
+                print(f"Authors: {authors}")
+                print(f"Abstract: {abstract}")
+                print(f"File Path: {file_path}")
+            else:
+                print(f"No paper found with ID: {arxiv_id}")
+        except Exception as e:
+            print(f"Error showing paper: {str(e)}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="arXiv Paper Organizer")
@@ -186,6 +213,10 @@ def main():
         "-l", "--limit", type=int, default=5, help="Number of results to return"
     )
 
+    # Show paper
+    show_parser = subparsers.add_parser("show", help="Show details of a specific paper")
+    show_parser.add_argument("paper_id", help="ID of the paper to show")
+
     args = parser.parse_args()
 
     organizer = ArXivOrganizer()
@@ -204,6 +235,8 @@ def main():
             print(f"Title: {title}")
             print(f"Authors: {authors}")
             print("---")
+    elif args.command == "show":
+        organizer.show_paper(args.paper_id)
     else:
         parser.print_help()
 
