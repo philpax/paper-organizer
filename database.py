@@ -1,8 +1,21 @@
+import json
 import sqlite3
 import os
+import sys
 import arxiv
 import argparse
 import re
+
+import requests
+
+
+def load_config():
+    try:
+        with open("config.json", "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print("Error: config.json not found.")
+        sys.exit(1)
 
 
 def is_valid_arxiv_id(arxiv_id):
@@ -11,10 +24,13 @@ def is_valid_arxiv_id(arxiv_id):
 
 
 class ArXivOrganizer:
-    def __init__(self, db_path="papers.db"):
-        self.db_path = db_path
+    def __init__(self, unsorted_path: str):
+        self.unsorted_path = unsorted_path
+        self.db_path = "papers.db"
         self.conn = sqlite3.connect(self.db_path)
         self.c = self.conn.cursor()
+        self.client = arxiv.Client()
+
         self._init_db()
 
     def _init_db(self):
@@ -46,6 +62,10 @@ class ArXivOrganizer:
         )
         self.conn.commit()
 
+    def get_paper_details(self, arxiv_id):
+        search = arxiv.Search(id_list=[arxiv_id])
+        return next(self.client.results(search))
+
     def add_paper(self, file_path):
         try:
             filename = os.path.splitext(os.path.basename(file_path))[0]
@@ -61,9 +81,7 @@ class ArXivOrganizer:
                 return
 
             # Fetch metadata from arXiv
-            client = arxiv.Client()
-            search = arxiv.Search(id_list=[arxiv_id])
-            paper = next(client.results(search))
+            paper = self.get_paper_details(arxiv_id)
 
             # Insert paper info into database
             self.c.execute(
@@ -153,9 +171,6 @@ class ArXivOrganizer:
             print(f"Error searching papers: {str(e)}")
             return []
 
-    def close(self):
-        self.conn.close()
-
     def show_paper(self, arxiv_id):
         try:
             self.c.execute(
@@ -184,8 +199,40 @@ class ArXivOrganizer:
         except Exception as e:
             print(f"Error showing paper: {str(e)}")
 
+    def download_paper(self, paper_id):
+        if not is_valid_arxiv_id(paper_id):
+            print("Invalid arXiv ID format: {paper_id}")
+            return
+
+        paper = self.get_paper_details(paper_id)
+
+        title = (
+            paper.title.replace(": ", " - ")
+            .replace("? ", " - ")
+            .replace("?", "")
+            .replace("/", "-")
+        )
+        url = f"https://arxiv.org/pdf/{paper_id}.pdf"
+        filename = f"{paper_id} - {title}.pdf"
+        full_path = os.path.join(self.unsorted_path, filename)
+
+        try:
+            pdf_response = requests.get(url, timeout=30)
+            pdf_response.raise_for_status()
+            with open(full_path, "wb") as f:
+                f.write(pdf_response.content)
+            print(f"Successfully downloaded: {filename}")
+        except requests.RequestException as e:
+            print(f"Failed to download {filename}: {str(e)}")
+
+    def close(self):
+        self.conn.close()
+
 
 def main():
+    config = load_config()
+    unsorted_path = config.get("unsorted_path")
+
     parser = argparse.ArgumentParser(description="arXiv Paper Organizer")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -207,6 +254,12 @@ def main():
     )
     remove_parser.add_argument("paper_id", help="ID of the paper to remove")
 
+    # Download paper
+    download_parser = subparsers.add_parser(
+        "download", help="Download a paper from arXiv"
+    )
+    download_parser.add_argument("paper_id", help="ID of the paper to download")
+
     # Search
     search_parser = subparsers.add_parser("search", help="Search for papers")
     search_parser.add_argument("query", help="Search query")
@@ -220,7 +273,7 @@ def main():
 
     args = parser.parse_args()
 
-    organizer = ArXivOrganizer()
+    organizer = ArXivOrganizer(unsorted_path)
 
     if args.command == "add":
         organizer.add_paper(args.file_path)
@@ -228,6 +281,8 @@ def main():
         organizer.add_folder(args.folder_path)
     elif args.command == "remove":
         organizer.remove_paper(args.paper_id)
+    elif args.command == "download":
+        organizer.download_paper(args.paper_id)
     elif args.command == "search":
         results = organizer.search(args.query, args.limit)
         print(f"Top {args.limit} results for '{args.query}':")
