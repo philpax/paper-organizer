@@ -5,6 +5,9 @@ import sys
 import arxiv
 import argparse
 import re
+import requests
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -225,6 +228,38 @@ class ArXivOrganizer:
         except requests.RequestException as e:
             print(f"Failed to download {filename}: {str(e)}")
 
+    def validate_date(self, date_string):
+        try:
+            datetime.strptime(date_string, "%Y-%m-%d")
+            return True
+        except ValueError:
+            return False
+
+    def fetch_daily_papers(self, date):
+        if not self.validate_date(date):
+            print("Invalid date format. Please use YYYY-MM-DD.")
+            return
+
+        url = f"https://huggingface.co/api/daily_papers?date={date}"
+        response = requests.get(url)
+        if response.status_code == 200:
+            papers = response.json()
+        else:
+            print(f"Error fetching data: {response.status_code}")
+            return
+
+        sorted_papers = sorted(papers, key=lambda x: -x["paper"]["upvotes"])
+        processed_paper_ids = [paper["paper"]["id"] for paper in sorted_papers]
+
+        # Use ThreadPoolExecutor for parallel downloads
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [
+                executor.submit(self.download_paper, paper_id)
+                for paper_id in processed_paper_ids
+            ]
+            for future in as_completed(futures):
+                _ = future.result()
+
     def close(self):
         self.conn.close()
 
@@ -271,6 +306,12 @@ def main():
     show_parser = subparsers.add_parser("show", help="Show details of a specific paper")
     show_parser.add_argument("paper_id", help="ID of the paper to show")
 
+    # Fetch daily papers
+    fetch_parser = subparsers.add_parser(
+        "fetch-daily-papers", help="Fetch and download daily papers from Hugging Face"
+    )
+    fetch_parser.add_argument("date", help="Date in YYYY-MM-DD format")
+
     args = parser.parse_args()
 
     organizer = ArXivOrganizer(unsorted_path)
@@ -293,6 +334,8 @@ def main():
             print("---")
     elif args.command == "show":
         organizer.show_paper(args.paper_id)
+    elif args.command == "fetch-daily-papers":
+        organizer.fetch_daily_papers(args.date)
     else:
         parser.print_help()
 
