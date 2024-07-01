@@ -156,7 +156,7 @@ class ArXivOrganizer:
         try:
             self.c.execute(
                 """
-                SELECT DISTINCT p.id, p.title, GROUP_CONCAT(DISTINCT a.name) as authors
+                SELECT DISTINCT p.id, p.title, GROUP_CONCAT(a.name, ', ') as authors
                 FROM papers p
                 LEFT JOIN paper_authors pa ON p.id = pa.paper_id
                 LEFT JOIN authors a ON pa.author_id = a.id
@@ -178,7 +178,7 @@ class ArXivOrganizer:
         try:
             self.c.execute(
                 """
-                SELECT p.title, p.abstract, p.file_path, GROUP_CONCAT(a.name, '; ') as authors
+                SELECT p.title, p.abstract, p.file_path, GROUP_CONCAT(a.name, ', ') as authors
                 FROM papers p
                 LEFT JOIN paper_authors pa ON p.id = pa.paper_id
                 LEFT JOIN authors a ON pa.author_id = a.id
