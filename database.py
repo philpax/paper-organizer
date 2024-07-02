@@ -207,6 +207,14 @@ class ArXivOrganizer:
             print("Invalid arXiv ID format: {paper_id}")
             return
 
+        # Bail out if there exists a file in `self.unsorted_path` starting with the paper_id
+        for file in os.listdir(self.unsorted_path):
+            if file.startswith(paper_id):
+                print(
+                    f"File for {paper_id} already exists in {self.unsorted_path}. Skipping."
+                )
+                return
+
         paper = self.get_paper_details(paper_id)
 
         title = (
