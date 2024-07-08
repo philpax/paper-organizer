@@ -2,7 +2,7 @@ import json
 import sqlite3
 import os
 import sys
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import arxiv
 import argparse
 import re
@@ -27,6 +27,30 @@ def load_config():
 def is_valid_arxiv_id(arxiv_id):
     pattern = r"^\d{4}\.\d{4,5}(v\d+)?$"
     return re.match(pattern, arxiv_id) is not None
+
+
+class Author:
+    def __init__(self, name: str, id: Optional[int] = None):
+        self.id = id
+        self.name = name
+
+
+class Paper:
+    def __init__(
+        self,
+        id: str,
+        title: str,
+        abstract: str,
+        file_path: str,
+        authors: List[Author],
+        index_id: int,
+    ):
+        self.id = id
+        self.index_id = index_id
+        self.title = title
+        self.abstract = abstract
+        self.file_path = file_path
+        self.authors = authors
 
 
 class ArXivOrganizer:
@@ -94,9 +118,9 @@ class ArXivOrganizer:
         ), f"Unexpected shape: {result.shape}, expected: ({self.dimension},)"
         return result
 
-    def _get_next_index_id(self):
+    def _get_next_index_id(self) -> int:
         self.c.execute("SELECT MAX(index_id) FROM papers")
-        max_id = self.c.fetchone()[0]
+        max_id: int = self.c.fetchone()[0]
         return (max_id or 0) + 1
 
     def _save_usearch_index(self):
@@ -106,7 +130,7 @@ class ArXivOrganizer:
         search = arxiv.Search(id_list=[arxiv_id])
         return next(self.client.results(search))
 
-    def add_paper(self, file_path):
+    def add_paper(self, file_path: str) -> None:
         try:
             filename = os.path.splitext(os.path.basename(file_path))[0]
             arxiv_id = filename.split(" - ")[0]
@@ -121,15 +145,29 @@ class ArXivOrganizer:
                 return
 
             # Fetch metadata from arXiv
-            paper = self.get_paper_details(arxiv_id)
+            arxiv_paper = self.get_paper_details(arxiv_id)
 
-            # Get the next available index_id
-            index_id = self._get_next_index_id()
+            # Create Paper object
+            authors = [Author(author.name) for author in arxiv_paper.authors]
+            paper = Paper(
+                id=arxiv_id,
+                index_id=self._get_next_index_id(),
+                title=arxiv_paper.title,
+                abstract=arxiv_paper.summary,
+                file_path=file_path,
+                authors=authors,
+            )
 
             # Insert paper info into database
             self.c.execute(
                 "INSERT INTO papers (id, index_id, title, abstract, file_path) VALUES (?, ?, ?, ?, ?)",
-                (arxiv_id, index_id, paper.title, paper.summary, file_path),
+                (
+                    paper.id,
+                    paper.index_id,
+                    paper.title,
+                    paper.abstract,
+                    paper.file_path,
+                ),
             )
 
             # Add authors
@@ -138,14 +176,14 @@ class ArXivOrganizer:
                     "INSERT OR IGNORE INTO authors (name) VALUES (?)", (author.name,)
                 )
                 self.c.execute("SELECT id FROM authors WHERE name = ?", (author.name,))
-                author_id = self.c.fetchone()[0]
+                author.id = self.c.fetchone()[0]
                 self.c.execute(
                     "INSERT INTO paper_authors (paper_id, author_id) VALUES (?, ?)",
-                    (arxiv_id, author_id),
+                    (paper.id, author.id),
                 )
 
             # Add categories
-            for category in paper.categories:
+            for category in arxiv_paper.categories:
                 self.c.execute(
                     "INSERT OR IGNORE INTO categories (name) VALUES (?)", (category,)
                 )
@@ -153,31 +191,29 @@ class ArXivOrganizer:
                 category_id = self.c.fetchone()[0]
                 self.c.execute(
                     "INSERT INTO paper_categories (paper_id, category_id) VALUES (?, ?)",
-                    (arxiv_id, category_id),
+                    (paper.id, category_id),
                 )
 
             # Add to USearch index
-            vector = self._get_embedding(f"{paper.title} {paper.summary}")
-            self.index.add(index_id, vector)
+            vector = self._get_embedding(f"{paper.title} {paper.abstract}")
+            self.index.add(paper.index_id, vector)
 
             self._save_usearch_index()
 
             self.conn.commit()
-            print(f"{arxiv_id}: {paper.title}")
+            print(f"{paper.id}: {paper.title}")
         except Exception as e:
             self.conn.rollback()
             print(f"Error adding paper: {str(e)}")
 
-    def add_folder(self, folder_path):
+    def add_folder(self, folder_path: str) -> None:
         for root, dirs, files in os.walk(folder_path, topdown=True):
-            # Modify dirs in-place to exclude 'Unsorted' from further traversal
             dirs[:] = [d for d in dirs if d != "Unsorted"]
-
             for file in files:
                 if file.endswith(".pdf"):
                     self.add_paper(os.path.join(root, file))
 
-    def remove_paper(self, paper_id):
+    def remove_paper(self, paper_id: str) -> None:
         try:
             # Check if paper exists
             self.c.execute("SELECT index_id FROM papers WHERE id = ?", (paper_id,))
@@ -206,7 +242,7 @@ class ArXivOrganizer:
             self.conn.rollback()
             print(f"Error removing paper: {str(e)}")
 
-    def search(self, query, limit=5):
+    def search(self, query: str, limit: int = 5) -> List[Tuple[str, str, str]]:
         try:
             self.c.execute(
                 """
@@ -222,8 +258,7 @@ class ArXivOrganizer:
                 """,
                 (f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%", limit),
             )
-            results = self.c.fetchall()
-            return results
+            return self.c.fetchall()
         except Exception as e:
             print(f"Error searching papers: {str(e)}")
             return []
@@ -242,47 +277,54 @@ class ArXivOrganizer:
                 LEFT JOIN authors a ON pa.author_id = a.id
                 WHERE p.index_id = ?
                 GROUP BY p.id
-            """,
+                """,
                 (int(index_id),),
             )
             paper_results.append(self.c.fetchone())
 
         return paper_results
 
-    def show_paper(self, arxiv_id):
+    def show_paper(self, arxiv_id: str) -> None:
         try:
             self.c.execute(
                 """
-                SELECT p.title, p.abstract, p.file_path, GROUP_CONCAT(a.name, ', ') as authors
+                SELECT p.title, p.abstract, p.file_path, p.index_id, GROUP_CONCAT(a.name, ', ') as authors
                 FROM papers p
                 LEFT JOIN paper_authors pa ON p.id = pa.paper_id
                 LEFT JOIN authors a ON pa.author_id = a.id
                 WHERE p.id = ?
                 GROUP BY p.id
-            """,
+                """,
                 (arxiv_id,),
             )
             result = self.c.fetchone()
 
             if result:
-                title, abstract, file_path, authors = result
-                cleaned_file_path = os.path.abspath(file_path).replace(" ", "%20")
-                print(f"ID: {arxiv_id}")
-                print(f"Title: {title}")
-                print(f"Authors: {authors}")
-                print(f"Abstract: {abstract}")
+                title, abstract, file_path, index_id, authors = result
+                paper = Paper(
+                    id=arxiv_id,
+                    title=title,
+                    abstract=abstract,
+                    file_path=file_path,
+                    authors=[Author(name) for name in authors.split(", ")],
+                    index_id=index_id,
+                )
+                cleaned_file_path = os.path.abspath(paper.file_path).replace(" ", "%20")
+                print(f"ID: {paper.id}")
+                print(f"Title: {paper.title}")
+                print(f"Authors: {', '.join(author.name for author in paper.authors)}")
+                print(f"Abstract: {paper.abstract}")
                 print(f"File Path: file://{cleaned_file_path}")
             else:
                 print(f"No paper found with ID: {arxiv_id}")
         except Exception as e:
             print(f"Error showing paper: {str(e)}")
 
-    def download_paper(self, paper_id):
+    def download_paper(self, paper_id: str) -> None:
         if not is_valid_arxiv_id(paper_id):
-            print("Invalid arXiv ID format: {paper_id}")
+            print(f"Invalid arXiv ID format: {paper_id}")
             return
 
-        # Bail out if there exists a file in `self.unsorted_path` starting with the paper_id
         for file in os.listdir(self.unsorted_path):
             if file.startswith(paper_id):
                 print(
@@ -290,10 +332,10 @@ class ArXivOrganizer:
                 )
                 return
 
-        paper = self.get_paper_details(paper_id)
+        arxiv_paper = self.get_paper_details(paper_id)
 
         title = (
-            paper.title.replace(": ", " - ")
+            arxiv_paper.title.replace(": ", " - ")
             .replace("? ", " - ")
             .replace("?", "")
             .replace("/", "-")
@@ -311,14 +353,14 @@ class ArXivOrganizer:
         except requests.RequestException as e:
             print(f"Failed to download {filename}: {str(e)}")
 
-    def validate_date(self, date_string):
+    def validate_date(self, date_string: str) -> bool:
         try:
             datetime.strptime(date_string, "%Y-%m-%d")
             return True
         except ValueError:
             return False
 
-    def fetch_daily_papers(self, date):
+    def fetch_daily_papers(self, date: str) -> None:
         if not self.validate_date(date):
             print("Invalid date format. Please use YYYY-MM-DD.")
             return
@@ -334,7 +376,6 @@ class ArXivOrganizer:
         sorted_papers = sorted(papers, key=lambda x: -x["paper"]["upvotes"])
         processed_paper_ids = [paper["paper"]["id"] for paper in sorted_papers]
 
-        # Use ThreadPoolExecutor for parallel downloads
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = [
                 executor.submit(self.download_paper, paper_id)
@@ -343,7 +384,7 @@ class ArXivOrganizer:
             for future in as_completed(futures):
                 _ = future.result()
 
-    def close(self):
+    def close(self) -> None:
         self.conn.close()
 
 
