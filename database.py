@@ -15,15 +15,6 @@ import torch
 from usearch.index import Index
 
 
-def load_config():
-    try:
-        with open("config.json", "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        print("Error: config.json not found.")
-        sys.exit(1)
-
-
 def is_valid_arxiv_id(arxiv_id):
     pattern = r"^\d{4}\.\d{4,5}(v\d+)?$"
     return re.match(pattern, arxiv_id) is not None
@@ -42,15 +33,17 @@ class Paper:
         title: str,
         abstract: str,
         file_path: str,
+        category_name: str,
         authors: List[Author],
         index_id: int,
     ):
         self.id = id
-        self.index_id = index_id
         self.title = title
         self.abstract = abstract
         self.file_path = file_path
+        self.category_name = category_name
         self.authors = authors
+        self.index_id = index_id
 
 
 class ArXivOrganizer:
@@ -78,15 +71,12 @@ class ArXivOrganizer:
                 index_id INTEGER UNIQUE,
                 title TEXT,
                 abstract TEXT,
-                file_path TEXT)"""
+                file_path TEXT,
+                category_id INTEGER REFERENCES categories(id))"""
         )
         self.c.execute("CREATE INDEX IF NOT EXISTS idx_index_id ON papers(index_id)")
         self.c.execute(
             """CREATE TABLE IF NOT EXISTS authors
-                        (id INTEGER PRIMARY KEY, name TEXT UNIQUE)"""
-        )
-        self.c.execute(
-            """CREATE TABLE IF NOT EXISTS categories
                         (id INTEGER PRIMARY KEY, name TEXT UNIQUE)"""
         )
         self.c.execute(
@@ -97,11 +87,10 @@ class ArXivOrganizer:
                         PRIMARY KEY(paper_id, author_id))"""
         )
         self.c.execute(
-            """CREATE TABLE IF NOT EXISTS paper_categories
-                        (paper_id TEXT, category_id INTEGER,
-                        FOREIGN KEY(paper_id) REFERENCES papers(id),
-                        FOREIGN KEY(category_id) REFERENCES categories(id),
-                        PRIMARY KEY(paper_id, category_id))"""
+            """CREATE TABLE IF NOT EXISTS categories
+                (id INTEGER PRIMARY KEY,
+                name TEXT UNIQUE,
+                mean_embedding BLOB)"""
         )
         self.conn.commit()
 
@@ -126,6 +115,35 @@ class ArXivOrganizer:
     def _save_usearch_index(self):
         self.index.save(self.index_path)
 
+    def _get_category_from_path(self, file_path: str) -> str:
+        return os.path.dirname(file_path)
+
+    def _update_category_mean_embedding(self, category_id: int):
+        self.c.execute(
+            """SELECT p.index_id
+            FROM papers p
+            WHERE p.category_id = ?""",
+            (category_id,),
+        )
+        paper_index_ids = [row[0] for row in self.c.fetchall()]
+
+        if not paper_index_ids:
+            return
+
+        embeddings = []
+        for index_id in paper_index_ids:
+            embedding = self.index.get(index_id)
+            if isinstance(embedding, np.ndarray):
+                embeddings.append(embedding)
+
+        if embeddings:
+            mean_embedding = np.mean(embeddings, axis=0)
+            self.c.execute(
+                "UPDATE categories SET mean_embedding = ? WHERE id = ?",
+                (mean_embedding.tobytes(), category_id),
+            )
+            self.conn.commit()
+
     def get_paper_details(self, arxiv_id):
         search = arxiv.Search(id_list=[arxiv_id])
         return next(self.client.results(search))
@@ -147,6 +165,14 @@ class ArXivOrganizer:
             # Fetch metadata from arXiv
             arxiv_paper = self.get_paper_details(arxiv_id)
 
+            # Add category
+            category_name = self._get_category_from_path(file_path)
+            self.c.execute(
+                "INSERT OR IGNORE INTO categories (name) VALUES (?)", (category_name,)
+            )
+            self.c.execute("SELECT id FROM categories WHERE name = ?", (category_name,))
+            category_id = self.c.fetchone()[0]
+
             # Create Paper object
             authors = [Author(author.name) for author in arxiv_paper.authors]
             paper = Paper(
@@ -155,18 +181,20 @@ class ArXivOrganizer:
                 title=arxiv_paper.title,
                 abstract=arxiv_paper.summary,
                 file_path=file_path,
+                category_name=category_name,
                 authors=authors,
             )
 
             # Insert paper info into database
             self.c.execute(
-                "INSERT INTO papers (id, index_id, title, abstract, file_path) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO papers (id, index_id, title, abstract, file_path, category_id) VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     paper.id,
                     paper.index_id,
                     paper.title,
                     paper.abstract,
                     paper.file_path,
+                    category_id,
                 ),
             )
 
@@ -182,21 +210,12 @@ class ArXivOrganizer:
                     (paper.id, author.id),
                 )
 
-            # Add categories
-            for category in arxiv_paper.categories:
-                self.c.execute(
-                    "INSERT OR IGNORE INTO categories (name) VALUES (?)", (category,)
-                )
-                self.c.execute("SELECT id FROM categories WHERE name = ?", (category,))
-                category_id = self.c.fetchone()[0]
-                self.c.execute(
-                    "INSERT INTO paper_categories (paper_id, category_id) VALUES (?, ?)",
-                    (paper.id, category_id),
-                )
-
             # Add to USearch index
             vector = self._get_embedding(f"{paper.title} {paper.abstract}")
             self.index.add(paper.index_id, vector)
+
+            # Update category mean embedding
+            self._update_category_mean_embedding(category_id)
 
             self._save_usearch_index()
 
@@ -216,23 +235,18 @@ class ArXivOrganizer:
     def remove_paper(self, paper_id: str) -> None:
         try:
             # Check if paper exists
-            self.c.execute("SELECT index_id FROM papers WHERE id = ?", (paper_id,))
+            self.c.execute("SELECT category_id FROM papers WHERE id = ?", (paper_id,))
             result = self.c.fetchone()
             if result is None:
                 print(f"Paper {paper_id} not found in the database.")
                 return
-            index_id = result[0]
+            category_id = result[0]
 
             # Remove from all tables
             self.c.execute("DELETE FROM paper_authors WHERE paper_id = ?", (paper_id,))
-            self.c.execute(
-                "DELETE FROM paper_categories WHERE paper_id = ?", (paper_id,)
-            )
-            self.c.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
 
-            # Remove from USearch index
-            if index_id is not None:
-                self.index.remove(index_id)
+            # Update category mean embedding
+            self._update_category_mean_embedding(category_id)
 
             self._save_usearch_index()
 
@@ -288,10 +302,13 @@ class ArXivOrganizer:
         try:
             self.c.execute(
                 """
-                SELECT p.title, p.abstract, p.file_path, p.index_id, GROUP_CONCAT(a.name, ', ') as authors
+                SELECT p.title, p.abstract, p.file_path, p.index_id,
+                       GROUP_CONCAT(a.name, ', ') as authors,
+                       c.name as category_name
                 FROM papers p
                 LEFT JOIN paper_authors pa ON p.id = pa.paper_id
                 LEFT JOIN authors a ON pa.author_id = a.id
+                LEFT JOIN categories c ON p.category_id = c.id
                 WHERE p.id = ?
                 GROUP BY p.id
                 """,
@@ -300,12 +317,13 @@ class ArXivOrganizer:
             result = self.c.fetchone()
 
             if result:
-                title, abstract, file_path, index_id, authors = result
+                title, abstract, file_path, index_id, authors, category_name = result
                 paper = Paper(
                     id=arxiv_id,
                     title=title,
                     abstract=abstract,
                     file_path=file_path,
+                    category_name=category_name,
                     authors=[Author(name) for name in authors.split(", ")],
                     index_id=index_id,
                 )
@@ -313,6 +331,7 @@ class ArXivOrganizer:
                 print(f"ID: {paper.id}")
                 print(f"Title: {paper.title}")
                 print(f"Authors: {', '.join(author.name for author in paper.authors)}")
+                print(f"Category: {paper.category_name}")
                 print(f"Abstract: {paper.abstract}")
                 print(f"File Path: file://{cleaned_file_path}")
             else:
@@ -389,7 +408,12 @@ class ArXivOrganizer:
 
 
 def main():
-    config = load_config()
+    try:
+        with open("config.json", "r") as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        print("Error: config.json not found.")
+        sys.exit(1)
     unsorted_path = config.get("unsorted_path")
 
     parser = argparse.ArgumentParser(description="arXiv Paper Organizer")
