@@ -9,6 +9,10 @@ readme = "README.md"
 python = "^3.11"
 requests = "^2.32.3"
 arxiv = "^2.1.3"
+usearch = "^2.12.0"
+sentence-transformers = "^3.0.1"
+numpy = "<2.0.0"
+transformers = "^4.42.3"
 
 
 [build-system]

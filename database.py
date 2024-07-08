@@ -2,14 +2,17 @@ import json
 import sqlite3
 import os
 import sys
+from typing import List, Tuple
 import arxiv
 import argparse
 import re
 import requests
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import requests
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import torch
+from usearch.index import Index
 
 
 def load_config():
@@ -34,13 +37,26 @@ class ArXivOrganizer:
         self.c = self.conn.cursor()
         self.client = arxiv.Client()
 
+        self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.dimension = 384  # Dimension of embeddings from 'all-MiniLM-L6-v2'
+
+        self.index_path = "papers_index.usearch"
+        self.index = Index(ndim=self.dimension, metric="l2sq")
+        if os.path.exists(self.index_path):
+            self.index.load(self.index_path)
+
         self._init_db()
 
     def _init_db(self):
         self.c.execute(
             """CREATE TABLE IF NOT EXISTS papers
-                        (id TEXT PRIMARY KEY, title TEXT, abstract TEXT, file_path TEXT)"""
+                (id TEXT PRIMARY KEY,
+                index_id INTEGER UNIQUE,
+                title TEXT,
+                abstract TEXT,
+                file_path TEXT)"""
         )
+        self.c.execute("CREATE INDEX IF NOT EXISTS idx_index_id ON papers(index_id)")
         self.c.execute(
             """CREATE TABLE IF NOT EXISTS authors
                         (id INTEGER PRIMARY KEY, name TEXT UNIQUE)"""
@@ -65,6 +81,27 @@ class ArXivOrganizer:
         )
         self.conn.commit()
 
+    def _get_embedding(self, text: str) -> np.ndarray:
+        result = self.encoder.encode(text)
+        if isinstance(result, list):
+            result = result[0]
+        if isinstance(result, torch.Tensor):
+            result = result.cpu().numpy()
+        if result.ndim == 2:
+            result = result[0]
+        assert result.shape == (
+            self.dimension,
+        ), f"Unexpected shape: {result.shape}, expected: ({self.dimension},)"
+        return result
+
+    def _get_next_index_id(self):
+        self.c.execute("SELECT MAX(index_id) FROM papers")
+        max_id = self.c.fetchone()[0]
+        return (max_id or 0) + 1
+
+    def _save_usearch_index(self):
+        self.index.save(self.index_path)
+
     def get_paper_details(self, arxiv_id):
         search = arxiv.Search(id_list=[arxiv_id])
         return next(self.client.results(search))
@@ -86,10 +123,13 @@ class ArXivOrganizer:
             # Fetch metadata from arXiv
             paper = self.get_paper_details(arxiv_id)
 
+            # Get the next available index_id
+            index_id = self._get_next_index_id()
+
             # Insert paper info into database
             self.c.execute(
-                "INSERT INTO papers (id, title, abstract, file_path) VALUES (?, ?, ?, ?)",
-                (arxiv_id, paper.title, paper.summary, file_path),
+                "INSERT INTO papers (id, index_id, title, abstract, file_path) VALUES (?, ?, ?, ?, ?)",
+                (arxiv_id, index_id, paper.title, paper.summary, file_path),
             )
 
             # Add authors
@@ -116,6 +156,12 @@ class ArXivOrganizer:
                     (arxiv_id, category_id),
                 )
 
+            # Add to USearch index
+            vector = self._get_embedding(f"{paper.title} {paper.summary}")
+            self.index.add(index_id, vector)
+
+            self._save_usearch_index()
+
             self.conn.commit()
             print(f"{arxiv_id}: {paper.title}")
         except Exception as e:
@@ -131,23 +177,31 @@ class ArXivOrganizer:
                 if file.endswith(".pdf"):
                     self.add_paper(os.path.join(root, file))
 
-    def remove_paper(self, arxiv_id):
+    def remove_paper(self, paper_id):
         try:
             # Check if paper exists
-            self.c.execute("SELECT id FROM papers WHERE id = ?", (arxiv_id,))
-            if self.c.fetchone() is None:
-                print(f"Paper {arxiv_id} not found in the database.")
+            self.c.execute("SELECT index_id FROM papers WHERE id = ?", (paper_id,))
+            result = self.c.fetchone()
+            if result is None:
+                print(f"Paper {paper_id} not found in the database.")
                 return
+            index_id = result[0]
 
             # Remove from all tables
-            self.c.execute("DELETE FROM paper_authors WHERE paper_id = ?", (arxiv_id,))
+            self.c.execute("DELETE FROM paper_authors WHERE paper_id = ?", (paper_id,))
             self.c.execute(
-                "DELETE FROM paper_categories WHERE paper_id = ?", (arxiv_id,)
+                "DELETE FROM paper_categories WHERE paper_id = ?", (paper_id,)
             )
-            self.c.execute("DELETE FROM papers WHERE id = ?", (arxiv_id,))
+            self.c.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
+
+            # Remove from USearch index
+            if index_id is not None:
+                self.index.remove(index_id)
+
+            self._save_usearch_index()
 
             self.conn.commit()
-            print(f"Paper {arxiv_id} removed successfully.")
+            print(f"Paper {paper_id} removed successfully.")
         except Exception as e:
             self.conn.rollback()
             print(f"Error removing paper: {str(e)}")
@@ -173,6 +227,27 @@ class ArXivOrganizer:
         except Exception as e:
             print(f"Error searching papers: {str(e)}")
             return []
+
+    def semantic_search(self, query: str, k: int = 5) -> List[Tuple[str, str, str]]:
+        query_vector = self._get_embedding(query)
+        results = self.index.search(query_vector, k)
+
+        paper_results = []
+        for index_id in results.keys:
+            self.c.execute(
+                """
+                SELECT p.id, p.title, GROUP_CONCAT(a.name, ', ') as authors
+                FROM papers p
+                LEFT JOIN paper_authors pa ON p.id = pa.paper_id
+                LEFT JOIN authors a ON pa.author_id = a.id
+                WHERE p.index_id = ?
+                GROUP BY p.id
+            """,
+                (int(index_id),),
+            )
+            paper_results.append(self.c.fetchone())
+
+        return paper_results
 
     def show_paper(self, arxiv_id):
         try:
@@ -310,6 +385,15 @@ def main():
         "-l", "--limit", type=int, default=5, help="Number of results to return"
     )
 
+    # Semantic search
+    semantic_search_parser = subparsers.add_parser(
+        "semantic-search", help="Perform semantic search"
+    )
+    semantic_search_parser.add_argument("query", help="Search query")
+    semantic_search_parser.add_argument(
+        "-k", type=int, default=5, help="Number of results to return"
+    )
+
     # Show paper
     show_parser = subparsers.add_parser("show", help="Show details of a specific paper")
     show_parser.add_argument("paper_id", help="ID of the paper to show")
@@ -335,6 +419,14 @@ def main():
     elif args.command == "search":
         results = organizer.search(args.query, args.limit)
         print(f"Top {args.limit} results for '{args.query}':")
+        for paper_id, title, authors in results:
+            print(f"ID: {paper_id}")
+            print(f"Title: {title}")
+            print(f"Authors: {authors}")
+            print("---")
+    elif args.command == "semantic-search":
+        results = organizer.semantic_search(args.query, args.k)
+        print(f"Top {args.k} semantic search results for '{args.query}':")
         for paper_id, title, authors in results:
             print(f"ID: {paper_id}")
             print(f"Title: {title}")
