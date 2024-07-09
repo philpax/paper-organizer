@@ -220,6 +220,13 @@ class ArXivOrganizer:
                 print(f"Skipping {paper_file}: Not a valid arXiv ID format.")
                 continue
 
+            if self.is_paper_in_database(arxiv_id):
+                print(
+                    f"Paper {arxiv_id} already exists in the database. Deleting copy."
+                )
+                os.remove(file_path)
+                continue
+
             try:
                 arxiv_paper = self.get_paper_details(arxiv_id)
                 print(f"Paper: {arxiv_paper.title} (ID: {arxiv_id})")
@@ -381,6 +388,10 @@ class ArXivOrganizer:
         except Exception as e:
             self.conn.rollback()
             print(f"Error removing paper: {str(e)}")
+
+    def is_paper_in_database(self, id: str) -> bool:
+        self.c.execute("SELECT id FROM papers WHERE id = ?", (id,))
+        return self.c.fetchone() is not None
 
     def search(self, query: str, limit: int = 5) -> List[Paper]:
         try:
