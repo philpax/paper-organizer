@@ -234,11 +234,15 @@ class ArXivOrganizer:
 
                 while True:
                     choice = input(
-                        "Enter the number of the category to assign (or empty to pick first, or 'q' to quit, 's' to skip): "
+                        "Enter the number of the category to assign (empty to pick first, 'q' to quit, 's' to skip, 'd' to delete): "
                     )
                     if choice.lower() == "q":
                         return
                     elif choice.lower() == "s":
+                        break
+                    elif choice.lower() == "d":
+                        os.remove(file_path)
+                        print("Paper deleted.")
                         break
                     elif choice.isdigit() and 1 <= int(choice) <= len(
                         closest_categories
