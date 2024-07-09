@@ -1,7 +1,9 @@
 import json
+import shutil
 import sqlite3
 import os
 import sys
+import traceback
 from typing import List, Optional, Tuple
 import arxiv
 import argparse
@@ -94,6 +96,9 @@ class ArXivOrganizer:
         )
         self.conn.commit()
 
+    def _get_embedding_text(self, arxiv_paper: arxiv.Result) -> str:
+        return f"{arxiv_paper.title} {arxiv_paper.summary}"
+
     def _get_embedding(self, text: str) -> np.ndarray:
         result = self.encoder.encode(text)
         if isinstance(result, list):
@@ -130,7 +135,7 @@ class ArXivOrganizer:
         if not paper_index_ids:
             return
 
-        embeddings = []
+        embeddings: List[np.ndarray] = []
         for index_id in paper_index_ids:
             embedding = self.index.get(index_id)
             if isinstance(embedding, np.ndarray):
@@ -144,9 +149,120 @@ class ArXivOrganizer:
             )
             self.conn.commit()
 
+    def _get_all_categories(self) -> List[Tuple[int, str, np.ndarray]]:
+        self.c.execute("SELECT id, name, mean_embedding FROM categories")
+        categories = self.c.fetchall()
+
+        categories_with_embeddings = []
+        for cat_id, cat_name, mean_embedding_bytes in categories:
+            if mean_embedding_bytes is not None:
+                mean_embedding = np.frombuffer(mean_embedding_bytes, dtype=np.float16)
+                categories_with_embeddings.append((cat_id, cat_name, mean_embedding))
+
+        return categories_with_embeddings
+
     def get_paper_details(self, arxiv_id):
         search = arxiv.Search(id_list=[arxiv_id])
         return next(self.client.results(search))
+
+    def rebuild_category_embeddings(self):
+        self.c.execute("SELECT id FROM categories")
+        category_ids = [row[0] for row in self.c.fetchall()]
+
+        for category_id in category_ids:
+            self._update_category_mean_embedding(category_id)
+
+    def get_closest_categories(
+        self,
+        categories_with_embeddings: List[Tuple[int, str, np.ndarray]],
+        arxiv_id: str,
+        k: int = 10,
+    ) -> List[Tuple[int, str, float]]:
+        arxiv_paper = self.get_paper_details(arxiv_id)
+        embedding_text = self._get_embedding_text(arxiv_paper)
+        paper_embedding = self._get_embedding(embedding_text)
+
+        distances = []
+        for cat_id, cat_name, mean_embedding in categories_with_embeddings:
+            distance = np.linalg.norm(paper_embedding - mean_embedding)
+            distances.append((cat_id, cat_name, distance))
+
+        return sorted(distances, key=lambda x: x[2])[:k]
+
+    def move_paper_to_category(self, file_path: str, category: Tuple[int, str]) -> str:
+        category_name = category[1]
+
+        new_path = os.path.join(
+            category_name,
+            os.path.basename(file_path),
+        )
+        shutil.move(file_path, new_path)
+
+        print(f"Paper moved to category: {category_name}")
+        return new_path
+
+    def categorize_unsorted_papers(self) -> None:
+        unsorted_papers = [
+            f for f in os.listdir(self.unsorted_path) if f.endswith(".pdf")
+        ]
+
+        all_categories = self._get_all_categories()
+        for paper_file in unsorted_papers:
+            arxiv_id = paper_file.split(" - ")[0]
+            file_path = os.path.join(self.unsorted_path, paper_file)
+
+            if not is_valid_arxiv_id(arxiv_id):
+                print(f"Skipping {paper_file}: Not a valid arXiv ID format.")
+                continue
+
+            try:
+                arxiv_paper = self.get_paper_details(arxiv_id)
+                print(f"Paper: {arxiv_paper.title} (ID: {arxiv_id})")
+
+                # print every line of the arxiv_paper.summary with a tab behind it
+                print(
+                    "\n".join(["  " + line for line in arxiv_paper.summary.split("\n")])
+                )
+
+                closest_categories = self.get_closest_categories(
+                    all_categories, arxiv_id
+                )
+
+                print("Closest categories:")
+                for i, (_, cat_name, distance) in enumerate(closest_categories, 1):
+                    print(f"  {i}. {cat_name} (Distance: {distance:.4f})")
+
+                while True:
+                    choice = input(
+                        "Enter the number of the category to assign (or empty to pick first, or 'q' to quit, 's' to skip): "
+                    )
+                    if choice.lower() == "q":
+                        return
+                    elif choice.lower() == "s":
+                        break
+                    elif choice.isdigit() and 1 <= int(choice) <= len(
+                        closest_categories
+                    ):
+                        selected_category = closest_categories[int(choice) - 1]
+                        new_path = self.move_paper_to_category(
+                            file_path, selected_category[:-1]
+                        )
+                        self.add_paper(new_path)
+                        break
+                    elif not choice:
+                        selected_category = closest_categories[0]
+                        new_path = self.move_paper_to_category(
+                            file_path, selected_category[:-1]
+                        )
+                        self.add_paper(new_path)
+                        break
+                    else:
+                        print("Invalid choice. Please try again.")
+
+                print("-----------------------------------")
+
+            except Exception as e:
+                print(f"Error processing paper {arxiv_id}: {traceback.format_exc()}")
 
     def add_paper(self, file_path: str) -> None:
         try:
@@ -211,7 +327,8 @@ class ArXivOrganizer:
                 )
 
             # Add to USearch index
-            vector = self._get_embedding(f"{paper.title} {paper.abstract}")
+            embedding_text = self._get_embedding_text(arxiv_paper)
+            vector = self._get_embedding(embedding_text)
             self.index.add(paper.index_id, vector)
 
             # Update category mean embedding
@@ -469,6 +586,14 @@ def main():
     )
     fetch_parser.add_argument("date", help="Date in YYYY-MM-DD format")
 
+    # Categorize unsorted papers
+    subparsers.add_parser("categorize", help="Categorize unsorted papers")
+
+    # Rebuild all category embeddings
+    subparsers.add_parser(
+        "rebuild-category-embeddings", help="Rebuild all category embeddings"
+    )
+
     args = parser.parse_args()
 
     organizer = ArXivOrganizer(unsorted_path)
@@ -501,6 +626,10 @@ def main():
         organizer.show_paper(args.paper_id)
     elif args.command == "fetch-daily-papers":
         organizer.fetch_daily_papers(args.date)
+    elif args.command == "categorize":
+        organizer.categorize_unsorted_papers()
+    elif args.command == "rebuild-category-embeddings":
+        organizer.rebuild_category_embeddings()
     else:
         parser.print_help()
 
