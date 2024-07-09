@@ -4,7 +4,7 @@ import sqlite3
 import os
 import sys
 import traceback
-from typing import List, Optional, Tuple
+from typing import List, Optional
 import arxiv
 import argparse
 import re
@@ -15,11 +15,6 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 import torch
 from usearch.index import Index
-
-
-def is_valid_arxiv_id(arxiv_id):
-    pattern = r"^\d{4}\.\d{4,5}(v\d+)?$"
-    return re.match(pattern, arxiv_id) is not None
 
 
 class Author:
@@ -35,7 +30,7 @@ class Paper:
         title: str,
         abstract: str,
         file_path: str,
-        category_name: str,
+        category: "Category",
         authors: List[Author],
         index_id: int,
     ):
@@ -43,9 +38,16 @@ class Paper:
         self.title = title
         self.abstract = abstract
         self.file_path = file_path
-        self.category_name = category_name
+        self.category = category
         self.authors = authors
         self.index_id = index_id
+
+
+class Category:
+    def __init__(self, id: int, name: str, mean_embedding: Optional[np.ndarray] = None):
+        self.id = id
+        self.name = name
+        self.mean_embedding = mean_embedding
 
 
 class ArXivOrganizer:
@@ -53,6 +55,7 @@ class ArXivOrganizer:
         self.unsorted_path = unsorted_path
         self.db_path = "papers.db"
         self.conn = sqlite3.connect(self.db_path)
+        self.conn.row_factory = sqlite3.Row
         self.c = self.conn.cursor()
         self.client = arxiv.Client()
 
@@ -114,7 +117,7 @@ class ArXivOrganizer:
 
     def _get_next_index_id(self) -> int:
         self.c.execute("SELECT MAX(index_id) FROM papers")
-        max_id: int = self.c.fetchone()[0]
+        max_id = self.c.fetchone()[0]
         return (max_id or 0) + 1
 
     def _save_usearch_index(self):
@@ -149,19 +152,25 @@ class ArXivOrganizer:
             )
             self.conn.commit()
 
-    def _get_all_categories(self) -> List[Tuple[int, str, np.ndarray]]:
+    def _get_all_categories(self) -> List[Category]:
         self.c.execute("SELECT id, name, mean_embedding FROM categories")
         categories = self.c.fetchall()
 
-        categories_with_embeddings = []
-        for cat_id, cat_name, mean_embedding_bytes in categories:
-            if mean_embedding_bytes is not None:
-                mean_embedding = np.frombuffer(mean_embedding_bytes, dtype=np.float16)
-                categories_with_embeddings.append((cat_id, cat_name, mean_embedding))
+        return [
+            Category(
+                cat["id"],
+                cat["name"],
+                (
+                    np.frombuffer(cat["mean_embedding"], dtype=np.float16)
+                    if cat["mean_embedding"]
+                    else None
+                ),
+            )
+            for cat in categories
+            if cat["mean_embedding"] is not None
+        ]
 
-        return categories_with_embeddings
-
-    def get_paper_details(self, arxiv_id):
+    def get_paper_details(self, arxiv_id: str) -> arxiv.Result:
         search = arxiv.Search(id_list=[arxiv_id])
         return next(self.client.results(search))
 
@@ -173,32 +182,28 @@ class ArXivOrganizer:
             self._update_category_mean_embedding(category_id)
 
     def get_closest_categories(
-        self,
-        categories_with_embeddings: List[Tuple[int, str, np.ndarray]],
-        arxiv_id: str,
-        k: int = 10,
-    ) -> List[Tuple[int, str, float]]:
+        self, categories: List[Category], arxiv_id: str, k: int = 10
+    ) -> List[Category]:
         arxiv_paper = self.get_paper_details(arxiv_id)
         embedding_text = self._get_embedding_text(arxiv_paper)
         paper_embedding = self._get_embedding(embedding_text)
 
-        distances = []
-        for cat_id, cat_name, mean_embedding in categories_with_embeddings:
-            distance = np.linalg.norm(paper_embedding - mean_embedding)
-            distances.append((cat_id, cat_name, distance))
+        distances = [
+            (cat, np.linalg.norm(paper_embedding - cat.mean_embedding))
+            for cat in categories
+            if cat.mean_embedding is not None
+        ]
 
-        return sorted(distances, key=lambda x: x[2])[:k]
+        return [cat for cat, _ in sorted(distances, key=lambda x: x[1])[:k]]
 
-    def move_paper_to_category(self, file_path: str, category: Tuple[int, str]) -> str:
-        category_name = category[1]
-
+    def move_paper_to_category(self, file_path: str, category: Category) -> str:
         new_path = os.path.join(
-            category_name,
+            category.name,
             os.path.basename(file_path),
         )
         shutil.move(file_path, new_path)
 
-        print(f"Paper moved to category: {category_name}")
+        print(f"Paper moved to category: {category.name}")
         return new_path
 
     def categorize_unsorted_papers(self) -> None:
@@ -218,8 +223,6 @@ class ArXivOrganizer:
             try:
                 arxiv_paper = self.get_paper_details(arxiv_id)
                 print(f"Paper: {arxiv_paper.title} (ID: {arxiv_id})")
-
-                # print every line of the arxiv_paper.summary with a tab behind it
                 print(
                     "\n".join(["  " + line for line in arxiv_paper.summary.split("\n")])
                 )
@@ -229,8 +232,8 @@ class ArXivOrganizer:
                 )
 
                 print("Closest categories:")
-                for i, (_, cat_name, distance) in enumerate(closest_categories, 1):
-                    print(f"  {i}. {cat_name} (Distance: {distance:.4f})")
+                for i, cat in enumerate(closest_categories, 1):
+                    print(f"  {i}. {cat.name}")
 
                 while True:
                     choice = input(
@@ -249,14 +252,14 @@ class ArXivOrganizer:
                     ):
                         selected_category = closest_categories[int(choice) - 1]
                         new_path = self.move_paper_to_category(
-                            file_path, selected_category[:-1]
+                            file_path, selected_category
                         )
                         self.add_paper(new_path)
                         break
                     elif not choice:
                         selected_category = closest_categories[0]
                         new_path = self.move_paper_to_category(
-                            file_path, selected_category[:-1]
+                            file_path, selected_category
                         )
                         self.add_paper(new_path)
                         break
@@ -292,6 +295,7 @@ class ArXivOrganizer:
             )
             self.c.execute("SELECT id FROM categories WHERE name = ?", (category_name,))
             category_id = self.c.fetchone()[0]
+            category = Category(category_id, category_name)
 
             # Create Paper object
             authors = [Author(author.name) for author in arxiv_paper.authors]
@@ -301,7 +305,7 @@ class ArXivOrganizer:
                 title=arxiv_paper.title,
                 abstract=arxiv_paper.summary,
                 file_path=file_path,
-                category_name=category_name,
+                category=category,
                 authors=authors,
             )
 
@@ -314,7 +318,7 @@ class ArXivOrganizer:
                     paper.title,
                     paper.abstract,
                     paper.file_path,
-                    category_id,
+                    paper.category.id,
                 ),
             )
 
@@ -336,7 +340,7 @@ class ArXivOrganizer:
             self.index.add(paper.index_id, vector)
 
             # Update category mean embedding
-            self._update_category_mean_embedding(category_id)
+            self._update_category_mean_embedding(category.id)
 
             self._save_usearch_index()
 
@@ -365,6 +369,7 @@ class ArXivOrganizer:
 
             # Remove from all tables
             self.c.execute("DELETE FROM paper_authors WHERE paper_id = ?", (paper_id,))
+            self.c.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
 
             # Update category mean embedding
             self._update_category_mean_embedding(category_id)
@@ -377,28 +382,41 @@ class ArXivOrganizer:
             self.conn.rollback()
             print(f"Error removing paper: {str(e)}")
 
-    def search(self, query: str, limit: int = 5) -> List[Tuple[str, str, str]]:
+    def search(self, query: str, limit: int = 5) -> List[Paper]:
         try:
             self.c.execute(
                 """
-                SELECT DISTINCT p.id, p.title, GROUP_CONCAT(a.name, ', ') as authors
+                SELECT DISTINCT p.id, p.title, p.abstract, p.file_path, p.index_id,
+                       c.id as category_id, c.name as category_name,
+                       GROUP_CONCAT(a.name, ', ') as authors
                 FROM papers p
                 LEFT JOIN paper_authors pa ON p.id = pa.paper_id
                 LEFT JOIN authors a ON pa.author_id = a.id
-                LEFT JOIN paper_categories pc ON p.id = pc.paper_id
-                LEFT JOIN categories c ON pc.category_id = c.id
+                LEFT JOIN categories c ON p.category_id = c.id
                 WHERE p.title LIKE ? OR p.abstract LIKE ? OR a.name LIKE ? OR c.name LIKE ?
                 GROUP BY p.id
                 LIMIT ?
                 """,
                 (f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%", limit),
             )
-            return self.c.fetchall()
+            results = self.c.fetchall()
+            return [
+                Paper(
+                    id=row["id"],
+                    title=row["title"],
+                    abstract=row["abstract"],
+                    file_path=row["file_path"],
+                    category=Category(row["category_id"], row["category_name"]),
+                    authors=[Author(name) for name in row["authors"].split(", ")],
+                    index_id=row["index_id"],
+                )
+                for row in results
+            ]
         except Exception as e:
             print(f"Error searching papers: {str(e)}")
             return []
 
-    def semantic_search(self, query: str, k: int = 5) -> List[Tuple[str, str, str]]:
+    def semantic_search(self, query: str, k: int = 5) -> List[Paper]:
         query_vector = self._get_embedding(query)
         results = self.index.search(query_vector, k)
 
@@ -406,26 +424,41 @@ class ArXivOrganizer:
         for index_id in results.keys:
             self.c.execute(
                 """
-                SELECT p.id, p.title, GROUP_CONCAT(a.name, ', ') as authors
+                SELECT p.id, p.title, p.abstract, p.file_path, p.index_id,
+                       c.id as category_id, c.name as category_name,
+                       GROUP_CONCAT(a.name, ', ') as authors
                 FROM papers p
                 LEFT JOIN paper_authors pa ON p.id = pa.paper_id
                 LEFT JOIN authors a ON pa.author_id = a.id
+                LEFT JOIN categories c ON p.category_id = c.id
                 WHERE p.index_id = ?
                 GROUP BY p.id
                 """,
                 (int(index_id),),
             )
-            paper_results.append(self.c.fetchone())
+            row = self.c.fetchone()
+            if row:
+                paper_results.append(
+                    Paper(
+                        id=row["id"],
+                        title=row["title"],
+                        abstract=row["abstract"],
+                        file_path=row["file_path"],
+                        category=Category(row["category_id"], row["category_name"]),
+                        authors=[Author(name) for name in row["authors"].split(", ")],
+                        index_id=row["index_id"],
+                    )
+                )
 
         return paper_results
 
-    def show_paper(self, arxiv_id: str) -> None:
+    def show_paper(self, arxiv_id: str) -> Optional[Paper]:
         try:
             self.c.execute(
                 """
-                SELECT p.title, p.abstract, p.file_path, p.index_id,
-                       GROUP_CONCAT(a.name, ', ') as authors,
-                       c.name as category_name
+                SELECT p.id, p.title, p.abstract, p.file_path, p.index_id,
+                       c.id as category_id, c.name as category_name,
+                       GROUP_CONCAT(a.name, ', ') as authors
                 FROM papers p
                 LEFT JOIN paper_authors pa ON p.id = pa.paper_id
                 LEFT JOIN authors a ON pa.author_id = a.id
@@ -435,30 +468,32 @@ class ArXivOrganizer:
                 """,
                 (arxiv_id,),
             )
-            result = self.c.fetchone()
+            row = self.c.fetchone()
 
-            if result:
-                title, abstract, file_path, index_id, authors, category_name = result
+            if row:
                 paper = Paper(
-                    id=arxiv_id,
-                    title=title,
-                    abstract=abstract,
-                    file_path=file_path,
-                    category_name=category_name,
-                    authors=[Author(name) for name in authors.split(", ")],
-                    index_id=index_id,
+                    id=row["id"],
+                    title=row["title"],
+                    abstract=row["abstract"],
+                    file_path=row["file_path"],
+                    category=Category(row["category_id"], row["category_name"]),
+                    authors=[Author(name) for name in row["authors"].split(", ")],
+                    index_id=row["index_id"],
                 )
                 cleaned_file_path = os.path.abspath(paper.file_path).replace(" ", "%20")
                 print(f"ID: {paper.id}")
                 print(f"Title: {paper.title}")
                 print(f"Authors: {', '.join(author.name for author in paper.authors)}")
-                print(f"Category: {paper.category_name}")
+                print(f"Category: {paper.category.name}")
                 print(f"Abstract: {paper.abstract}")
                 print(f"File Path: file://{cleaned_file_path}")
+                return paper
             else:
                 print(f"No paper found with ID: {arxiv_id}")
+                return None
         except Exception as e:
             print(f"Error showing paper: {str(e)}")
+            return None
 
     def download_paper(self, paper_id: str) -> None:
         if not is_valid_arxiv_id(paper_id):
@@ -493,7 +528,8 @@ class ArXivOrganizer:
         except requests.RequestException as e:
             print(f"Failed to download {filename}: {str(e)}")
 
-    def validate_date(self, date_string: str) -> bool:
+    @staticmethod
+    def validate_date(date_string: str) -> bool:
         try:
             datetime.strptime(date_string, "%Y-%m-%d")
             return True
@@ -526,6 +562,11 @@ class ArXivOrganizer:
 
     def close(self) -> None:
         self.conn.close()
+
+
+def is_valid_arxiv_id(arxiv_id: str) -> bool:
+    pattern = r"^\d{4}\.\d{4,5}(v\d+)?$"
+    return re.match(pattern, arxiv_id) is not None
 
 
 def main():
@@ -613,18 +654,18 @@ def main():
     elif args.command == "search":
         results = organizer.search(args.query, args.limit)
         print(f"Top {args.limit} results for '{args.query}':")
-        for paper_id, title, authors in results:
-            print(f"ID: {paper_id}")
-            print(f"Title: {title}")
-            print(f"Authors: {authors}")
+        for paper in results:
+            print(f"ID: {paper.id}")
+            print(f"Title: {paper.title}")
+            print(f"Authors: {', '.join(author.name for author in paper.authors)}")
             print("---")
     elif args.command == "semantic-search":
         results = organizer.semantic_search(args.query, args.k)
         print(f"Top {args.k} semantic search results for '{args.query}':")
-        for paper_id, title, authors in results:
-            print(f"ID: {paper_id}")
-            print(f"Title: {title}")
-            print(f"Authors: {authors}")
+        for paper in results:
+            print(f"ID: {paper.id}")
+            print(f"Title: {paper.title}")
+            print(f"Authors: {', '.join(author.name for author in paper.authors)}")
             print("---")
     elif args.command == "show":
         organizer.show_paper(args.paper_id)
