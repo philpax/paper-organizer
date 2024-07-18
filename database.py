@@ -210,9 +210,10 @@ class ArXivOrganizer:
         unsorted_papers = [
             f for f in os.listdir(self.unsorted_path) if f.endswith(".pdf")
         ]
+        total_papers = len(unsorted_papers)
 
         all_categories = self._get_all_categories()
-        for paper_file in unsorted_papers:
+        for idx, paper_file in enumerate(unsorted_papers):
             arxiv_id = paper_file.split(" - ")[0]
             file_path = os.path.join(self.unsorted_path, paper_file)
 
@@ -229,7 +230,9 @@ class ArXivOrganizer:
 
             try:
                 arxiv_paper = self.get_paper_details(arxiv_id)
-                print(f"Paper: {arxiv_paper.title} (ID: {arxiv_id})")
+                print(
+                    f"Paper: {arxiv_paper.title} (ID: {arxiv_id}) [{idx+1}/{total_papers}, {idx/total_papers:.0%}]"
+                )
                 print(
                     "\n".join(["  " + line for line in arxiv_paper.summary.split("\n")])
                 )
